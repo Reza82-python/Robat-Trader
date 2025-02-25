@@ -1,0 +1,15 @@
+LICENSE
+README.md
+setup.cfg
+setup.py
+pyxt/perp.py
+pyxt/spot.py
+pyxt.egg-info/PKG-INFO
+pyxt.egg-info/SOURCES.txt
+pyxt.egg-info/dependency_links.txt
+pyxt.egg-info/not-zip-safe
+pyxt.egg-info/requires.txt
+pyxt.egg-info/top_level.txt
+pyxt/websocket/perp.py
+pyxt/websocket/spot.py
+pyxt/websocket/xt_websocket.py
