@@ -20,6 +20,6 @@ if 'result' in response:
     df['timestamp'] = pd.to_datetime(df['timestamp'] , unit = 'ms')
     #df = df.sort_values('timestamp',ascending=True)
 
-    df.to_csv("bybit_btc_price.csv",date_format='%Y-%m-%d')
+    df.to_csv("bybit_btc_price.csv",date_format='%Y-%m-%d' , index = False)
 
     print(df.head())
