@@ -1,6 +1,7 @@
 from pybit.unified_trading import HTTP
 import pandas as pd
 import time
+import talib
 
 # اتصال به Bybit (در حالت تست‌نت)
 url = HTTP(testnet=True)
@@ -20,6 +21,7 @@ if 'result' in response:
     df['timestamp'] = pd.to_datetime(df['timestamp'] , unit = 'ms')
     #df = df.sort_values('timestamp',ascending=True)
 
-    df.to_csv("bybit_btc_price.csv",date_format='%Y-%m-%d' , index = False)
-
+    #df.to_csv("bybit_btc_price.csv",date_format='%Y-%m-%d' , index = False)
+    print(df.info())
+    print(df.isnull().sum())
     print(df.head())
