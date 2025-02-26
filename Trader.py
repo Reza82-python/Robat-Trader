@@ -9,8 +9,7 @@ response = url.get_index_price_kline(
     category="linear",  # نوع قرارداد (linear برای فیوچرز)
     symbol="BTCUSDT",  # نماد بازار (BTC/USDT)
     interval=240,  # تایم‌فریم (60 دقیقه)
-    limit=500,  # تعداد داده‌ها، فقط یک کندل آخر
-    start=int(time.time()) - 86400,
+    limit=1000,  # تعداد داده‌ها، فقط یک کندل آخر
 )
 if 'result' in response:
     kline_data = response['result']
@@ -19,7 +18,8 @@ if 'result' in response:
     df.drop(columns = ['list', 'category'] , inplace=True)
     df['timestamp'] = pd.to_numeric(df['timestamp'])
     df['timestamp'] = pd.to_datetime(df['timestamp'] , unit = 'ms')
+    #df = df.sort_values('timestamp',ascending=True)
 
-    df.to_csv("bybit_btc_price.csv",index=True)
+    df.to_csv("bybit_btc_price.csv",date_format='%Y-%m-%d')
 
     print(df.head())
