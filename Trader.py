@@ -1,7 +1,7 @@
 from pybit.unified_trading import HTTP
 import pandas as pd
 import time
-import talib
+
 
 # اتصال به Bybit (در حالت تست‌نت)
 url = HTTP(testnet=True)
