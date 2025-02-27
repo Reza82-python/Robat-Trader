@@ -1,7 +1,7 @@
 from pybit.unified_trading import HTTP
 import pandas as pd
 import time
-
+from finta import TA
 
 # اتصال به Bybit (در حالت تست‌نت)
 url = HTTP(testnet=True)
@@ -19,6 +19,7 @@ if 'result' in response:
     df.drop(columns = ['list', 'category'] , inplace=True)
     df['timestamp'] = pd.to_numeric(df['timestamp'])
     df['timestamp'] = pd.to_datetime(df['timestamp'] , unit = 'ms')
+    df['SMA_50'] = TA.EMA(df, 50)
     #df = df.sort_values('timestamp',ascending=True)
 
     #df.to_csv("bybit_btc_price.csv",date_format='%Y-%m-%d' , index = False)
