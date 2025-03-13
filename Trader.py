@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 import time
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import Dense, Dropout, MultiHeadAttention, LayerNormalization, Input
+from tensorflow.keras.models import Model
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import accuracy_score
 
@@ -16,7 +17,7 @@ def resample_to_5m(data):
 
 
 # تابع محاسبه MFI
-def calculate_mfi(data, period=14):  # دوره 10 برای سیگنال بیشتر
+def calculate_mfi(data, period=14):
     data["Typical_Price"] = (data["High"] + data["Low"] + data["Close"]) / 3
     data["Raw_Money_Flow"] = data["Typical_Price"] * data["Volume"]
     data["Price_Diff"] = data["Typical_Price"].diff()
@@ -32,7 +33,7 @@ def calculate_mfi(data, period=14):  # دوره 10 برای سیگنال بیش�
 
 
 # تابع محاسبه SMMA
-def calculate_smma(data, period=50):  # دوره 50 برای معاملات بیشتر
+def calculate_smma(data, period=100):
     data["SMMA"] = data["Close"].rolling(window=period).mean()
     for i in range(period, len(data)):
         data.loc[data.index[i], "SMMA"] = (
@@ -43,18 +44,16 @@ def calculate_smma(data, period=50):  # دوره 50 برای معاملات بی
     data["Volatility"] = data["High"] - data["Low"]
     data["High_Change"] = data["High"].pct_change()
     data["Low_Change"] = data["Low"].pct_change()
-    data["High_to_SMMA"] = data["High"] / data["SMMA"]  # ویژگی جدید
     return data
 
 
-# تابع آماده‌سازی داده برای LSTM
-def prepare_lstm_data(data, lookback=50):
+# تابع آماده‌سازی داده برای Transformer
+def prepare_transformer_data(data, lookback=50):
     data = calculate_smma(data.copy())
     data = calculate_mfi(data)
     data["Target"] = (data["Close"].shift(-1) > data["Close"]).astype(int)
-    features = data[
-        ["Close", "SMMA", "MFI", "Price_Change", "Price_Diff", "Volume", "Volatility", "High_Change", "Low_Change",
-         "High_to_SMMA"]].dropna()
+    features = data[["Close", "SMMA", "MFI", "Price_Change", "Price_Diff", "Volume", "Volatility", "High_Change",
+                     "Low_Change"]].dropna()
     target = data["Target"].dropna()
 
     scaler = MinMaxScaler()
@@ -70,26 +69,31 @@ def prepare_lstm_data(data, lookback=50):
     return X, y, scaler, features.columns
 
 
-# تابع آموزش مدل LSTM
-def train_lstm_model(data):
-    X, y, scaler, feature_cols = prepare_lstm_data(data)
+# تابع آموزش مدل Transformer
+def train_transformer_model(data):
+    X, y, scaler, feature_cols = prepare_transformer_data(data)
     train_size = int(len(X) * 0.8)
     X_train, X_test = X[:train_size], X[train_size:]
     y_train, y_test = y[:train_size], y[train_size:]
 
-    model = Sequential()
-    model.add(LSTM(100, return_sequences=True, input_shape=(X.shape[1], X.shape[2])))  # قوی‌تر
-    model.add(Dropout(0.3))
-    model.add(LSTM(100))
-    model.add(Dropout(0.3))
-    model.add(Dense(1, activation="sigmoid"))
+    inputs = Input(shape=(X.shape[1], X.shape[2]))
+    x = MultiHeadAttention(num_heads=4, key_dim=64)(inputs, inputs)
+    x = LayerNormalization(epsilon=1e-6)(x)
+    x = Dropout(0.3)(x)
+    x = MultiHeadAttention(num_heads=4, key_dim=64)(x, x)
+    x = LayerNormalization(epsilon=1e-6)(x)
+    x = Dropout(0.3)(x)
+    x = Dense(64, activation="relu")(x[:, -1, :])  # فقط آخرین timestep
+    x = Dropout(0.3)(x)
+    outputs = Dense(1, activation="sigmoid")(x)
 
+    model = Model(inputs, outputs)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
     model.fit(X_train, y_train, epochs=50, batch_size=32, validation_split=0.1, verbose=1)
 
     y_pred = (model.predict(X_test) > 0.5).astype(int)
     accuracy = accuracy_score(y_test, y_pred)
-    print(f"دقت مدل LSTM روی داده تست: {accuracy:.2f}")
+    print(f"دقت مدل Transformer روی داده تست: {accuracy:.2f}")
     return model, X_test, y_test, scaler, feature_cols
 
 
@@ -105,7 +109,7 @@ def backtest(data_5m, model, X_test, y_test, scaler, feature_cols):
     ml_total = 0
     test_start_idx = len(data_5m) - len(X_test)
 
-    for i in range(50, len(data_5m)):  # از 50 برای SMMA 50
+    for i in range(100, len(data_5m)):
         close = data_5m["Close"].iloc[i]
         smma = data_5m["SMMA"].iloc[i]
         mfi_buy = data_5m["MFI_Buy_Signal"].iloc[i]
@@ -120,9 +124,9 @@ def backtest(data_5m, model, X_test, y_test, scaler, feature_cols):
 
         # خرید
         if mfi_buy == 1 and close > smma and position == 0:
-            risk_amount = initial_cash * 0.01
-            stop_loss = close * 0.985  # 1.5% ضرر
-            take_profit = close * 1.03  # 3% سود (1:2)
+            risk_amount = initial_cash * 0.01  # 1% ریسک
+            stop_loss = close * 0.99  # 1% ضرر
+            take_profit = close * 1.02  # 2% سود (1:2)
             position_size = risk_amount / (close - stop_loss)
             position = position_size
             cash -= position * close
@@ -155,7 +159,7 @@ dow_jones = yf.Ticker(symbol)
 print("آماده‌سازی داده‌ها و آموزش مدل...")
 raw_data_5m = dow_jones.history(period="60d", interval="5m")
 data_5m = resample_to_5m(raw_data_5m)
-model, X_test, y_test, scaler, feature_cols = train_lstm_model(data_5m)
+model, X_test, y_test, scaler, feature_cols = train_transformer_model(data_5m)
 
 print("\nشروع بک‌تست...")
 backtest(data_5m, model, X_test, y_test, scaler, feature_cols)
@@ -174,7 +178,7 @@ while True:
         mfi_buy = data_5m["MFI_Buy_Signal"].iloc[-1]
         mfi_sell = data_5m["MFI_Sell_Signal"].iloc[-1]
 
-        last_features = data_5m[feature_cols].iloc[-50:]  # 50 کندل آخر برای lookback=50
+        last_features = data_5m[feature_cols].iloc[-50:]
         scaled_features = scaler.transform(last_features)
         last_input = np.expand_dims(scaled_features, axis=0)
         ml_pred = (model.predict(last_input, verbose=0) > 0.5).astype(int)[0]
