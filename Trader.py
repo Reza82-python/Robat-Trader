@@ -9,13 +9,6 @@ from sklearn.metrics import accuracy_score
 import keras_tuner as kt
 
 
-# تابع تبدیل داده به 4 ساعت
-def resample_to_4h(data):
-    return data.resample("4h").agg({
-        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
-    }).dropna()
-
-
 # تابع پیدا کردن سطوح کلیدی
 def find_key_levels(data, tolerance=0.002):  # 0.2% تحمل
     all_prices = np.concatenate([data["Open"], data["Close"], data["High"], data["Low"]])
@@ -25,6 +18,7 @@ def find_key_levels(data, tolerance=0.002):  # 0.2% تحمل
         if hits >= 5:  # حداقل 5 برخورد
             price_levels[price] = hits
 
+    # مرتب‌سازی از بیشترین برخورد به کمترین
     sorted_levels = sorted(price_levels.items(), key=lambda x: x[1], reverse=True)
     return sorted_levels
 
@@ -82,10 +76,10 @@ def train_transformer_model(data):
     tuner = kt.RandomSearch(
         build_model,
         objective="val_accuracy",
-        max_trials=15,  # تست بیشتر
+        max_trials=15,
         executions_per_trial=1,
         directory="tuner_dir",
-        project_name="transformer_4h"
+        project_name="transformer_1d"
     )
 
     tuner.search(X_train, y_train, epochs=50, batch_size=32, validation_split=0.1, verbose=1)
@@ -103,28 +97,28 @@ symbol = "^DJI"
 dow_jones = yf.Ticker(symbol)
 
 print("آماده‌سازی داده‌ها...")
-raw_data_4h = dow_jones.history(period="2y", interval="4h")  # 2 سال برای داده بیشتر
-data_4h = resample_to_4h(raw_data_4h)
+raw_data_1d = dow_jones.history(period="2y", interval="1d")  # 2 سال، روزانه
+data_1d = raw_data_1d.copy()  # مستقیم استفاده می‌کنیم
 
 # پیدا کردن سطوح کلیدی
-key_levels = find_key_levels(data_4h)
+key_levels = find_key_levels(data_1d)
 print("\nمهم‌ترین سطوح قیمتی داوجونز (بیشترین برخورد به کمترین):")
 for level, hits in key_levels[:20]:  # 20 سطح برتر
     print(f"سطح: {level:.2f} | تعداد برخورد: {hits}")
 
 # آموزش مدل ML
 print("\nآموزش مدل Transformer...")
-model, X_test, y_test, scaler, feature_cols = train_transformer_model(data_4h)
+model, X_test, y_test, scaler, feature_cols = train_transformer_model(data_1d)
 
 # اجرای لحظه‌ای
-print("\nشروع اجرای لحظه‌ای (هر 4 ساعت)...")
+print("\nشروع اجرای لحظه‌ای (هر روز)...")
 while True:
     try:
-        raw_data_4h = dow_jones.history(period="30d", interval="4h")
-        data_4h = resample_to_4h(raw_data_4h)
+        raw_data_1d = dow_jones.history(period="30d", interval="1d")
+        data_1d = raw_data_1d.copy()
 
-        last_close = data_4h["Close"].iloc[-1]
-        last_features = data_4h[feature_cols].iloc[-50:]
+        last_close = data_1d["Close"].iloc[-1]
+        last_features = data_1d[feature_cols].iloc[-50:]
         scaled_features = scaler.transform(last_features)
         last_input = np.expand_dims(scaled_features, axis=0)
         ml_pred = (model.predict(last_input, verbose=0) > 0.5).astype(int)[0]
@@ -134,7 +128,7 @@ while True:
         nearest_level = min(key_levels, key=lambda x: abs(x[0] - last_close))[0]
         print(
             f"{time.ctime()} | قیمت: {last_close:.2f} | نزدیک‌ترین سطح: {nearest_level:.2f} | پیش‌بینی ML: {ml_signal}")
-        time.sleep(14400)  # 4 ساعت
+        time.sleep(86400)  # 1 روز
     except Exception as e:
         print(f"خطا: {e}")
         time.sleep(60)
