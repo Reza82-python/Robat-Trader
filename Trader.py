@@ -2,16 +2,16 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 import time
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout, MultiHeadAttention, LayerNormalization, Input
 from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Dropout, MultiHeadAttention, LayerNormalization, Input
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import accuracy_score
+import keras_tuner as kt
 
 
-# تابع تبدیل داده به 5 دقیقه
-def resample_to_5m(data):
-    return data.resample("5min").agg({
+# تابع تبدیل داده به 1 ساعت
+def resample_to_1h(data):
+    return data.resample("1h").agg({
         "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
     }).dropna()
 
@@ -47,8 +47,8 @@ def calculate_smma(data, period=100):
     return data
 
 
-# تابع آماده‌سازی داده برای Transformer
-def prepare_transformer_data(data, lookback=50):
+# تابع آماده‌سازی داده
+def prepare_data(data, lookback=50):
     data = calculate_smma(data.copy())
     data = calculate_mfi(data)
     data["Target"] = (data["Close"].shift(-1) > data["Close"]).astype(int)
@@ -69,51 +69,73 @@ def prepare_transformer_data(data, lookback=50):
     return X, y, scaler, features.columns
 
 
-# تابع آموزش مدل Transformer
-def train_transformer_model(data):
-    X, y, scaler, feature_cols = prepare_transformer_data(data)
-    train_size = int(len(X) * 0.8)
-    X_train, X_test = X[:train_size], X[train_size:]
-    y_train, y_test = y[:train_size], y[train_size:]
-
-    inputs = Input(shape=(X.shape[1], X.shape[2]))
-    x = MultiHeadAttention(num_heads=4, key_dim=64)(inputs, inputs)
+# تابع ساخت مدل برای Keras Tuner
+def build_model(hp):
+    inputs = Input(shape=(50, 9))  # lookback=50, 9 ویژگی
+    x = MultiHeadAttention(
+        num_heads=hp.Int("num_heads", 2, 8, step=2),
+        key_dim=hp.Int("key_dim", 32, 128, step=32)
+    )(inputs, inputs)
     x = LayerNormalization(epsilon=1e-6)(x)
-    x = Dropout(0.3)(x)
-    x = MultiHeadAttention(num_heads=4, key_dim=64)(x, x)
+    x = Dropout(hp.Float("dropout_1", 0.1, 0.5, step=0.1))(x)
+    x = MultiHeadAttention(
+        num_heads=hp.Int("num_heads_2", 2, 8, step=2),
+        key_dim=hp.Int("key_dim_2", 32, 128, step=32)
+    )(x, x)
     x = LayerNormalization(epsilon=1e-6)(x)
-    x = Dropout(0.3)(x)
-    x = Dense(64, activation="relu")(x[:, -1, :])  # فقط آخرین timestep
-    x = Dropout(0.3)(x)
+    x = Dropout(hp.Float("dropout_2", 0.1, 0.5, step=0.1))(x)
+    x = Dense(hp.Int("dense_units", 32, 128, step=32), activation="relu")(x[:, -1, :])
+    x = Dropout(hp.Float("dropout_3", 0.1, 0.5, step=0.1))(x)
     outputs = Dense(1, activation="sigmoid")(x)
 
     model = Model(inputs, outputs)
     model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
-    model.fit(X_train, y_train, epochs=50, batch_size=32, validation_split=0.1, verbose=1)
+    return model
 
-    y_pred = (model.predict(X_test) > 0.5).astype(int)
+
+# تابع آموزش مدل با Keras Tuner
+def train_transformer_model(data):
+    X, y, scaler, feature_cols = prepare_data(data)
+    train_size = int(len(X) * 0.8)
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
+
+    tuner = kt.RandomSearch(
+        build_model,
+        objective="val_accuracy",
+        max_trials=10,  # تعداد تست‌ها
+        executions_per_trial=1,
+        directory="tuner_dir",
+        project_name="transformer_tuning"
+    )
+
+    tuner.search(X_train, y_train, epochs=50, batch_size=32, validation_split=0.1, verbose=1)
+    best_model = tuner.get_best_models(num_models=1)[0]
+
+    y_pred = (best_model.predict(X_test) > 0.5).astype(int)
     accuracy = accuracy_score(y_test, y_pred)
     print(f"دقت مدل Transformer روی داده تست: {accuracy:.2f}")
-    return model, X_test, y_test, scaler, feature_cols
+    print(f"بهترین پارامترها: {tuner.get_best_hyperparameters()[0].values}")
+    return best_model, X_test, y_test, scaler, feature_cols
 
 
 # تابع بک‌تست
-def backtest(data_5m, model, X_test, y_test, scaler, feature_cols):
-    data_5m = calculate_smma(data_5m.copy())
-    data_5m = calculate_mfi(data_5m)
+def backtest(data_1h, model, X_test, y_test, scaler, feature_cols):
+    data_1h = calculate_smma(data_1h.copy())
+    data_1h = calculate_mfi(data_1h)
     initial_cash = 10000
     cash = initial_cash
     position = 0
     trades = []
     ml_correct = 0
     ml_total = 0
-    test_start_idx = len(data_5m) - len(X_test)
+    test_start_idx = len(data_1h) - len(X_test)
 
-    for i in range(100, len(data_5m)):
-        close = data_5m["Close"].iloc[i]
-        smma = data_5m["SMMA"].iloc[i]
-        mfi_buy = data_5m["MFI_Buy_Signal"].iloc[i]
-        mfi_sell = data_5m["MFI_Sell_Signal"].iloc[i]
+    for i in range(100, len(data_1h)):
+        close = data_1h["Close"].iloc[i]
+        smma = data_1h["SMMA"].iloc[i]
+        mfi_buy = data_1h["MFI_Buy_Signal"].iloc[i]
+        mfi_sell = data_1h["MFI_Sell_Signal"].iloc[i]
 
         if i >= test_start_idx and i - test_start_idx < len(X_test):
             ml_pred = (model.predict(X_test[i - test_start_idx:i - test_start_idx + 1], verbose=0) > 0.5).astype(int)[0]
@@ -130,20 +152,20 @@ def backtest(data_5m, model, X_test, y_test, scaler, feature_cols):
             position_size = risk_amount / (close - stop_loss)
             position = position_size
             cash -= position * close
-            trades.append(("خرید", close, stop_loss, take_profit, data_5m.index[i]))
+            trades.append(("خرید", close, stop_loss, take_profit, data_1h.index[i]))
 
         # فروش
         elif position > 0:
             if mfi_sell == 1 and close < smma:
                 cash += position * close
                 position = 0
-                trades.append(("فروش (MFI)", close, data_5m.index[i]))
+                trades.append(("فروش (MFI)", close, data_1h.index[i]))
             elif close >= take_profit or close <= stop_loss:
                 cash += position * close
                 position = 0
-                trades.append(("فروش (حد)", close, data_5m.index[i]))
+                trades.append(("فروش (حد)", close, data_1h.index[i]))
 
-    final_value = cash + (position * data_5m["Close"].iloc[-1]) if position > 0 else cash
+    final_value = cash + (position * data_1h["Close"].iloc[-1]) if position > 0 else cash
     profit = final_value - initial_cash
     ml_accuracy = ml_correct / ml_total * 100 if ml_total > 0 else 0
 
@@ -157,28 +179,28 @@ symbol = "^DJI"
 dow_jones = yf.Ticker(symbol)
 
 print("آماده‌سازی داده‌ها و آموزش مدل...")
-raw_data_5m = dow_jones.history(period="60d", interval="5m")
-data_5m = resample_to_5m(raw_data_5m)
-model, X_test, y_test, scaler, feature_cols = train_transformer_model(data_5m)
+raw_data_1h = dow_jones.history(period="1y", interval="1h")  # 1 سال برای داده بیشتر
+data_1h = resample_to_1h(raw_data_1h)
+model, X_test, y_test, scaler, feature_cols = train_transformer_model(data_1h)
 
 print("\nشروع بک‌تست...")
-backtest(data_5m, model, X_test, y_test, scaler, feature_cols)
+backtest(data_1h, model, X_test, y_test, scaler, feature_cols)
 
 # اجرای لحظه‌ای
-print("\nشروع اجرای لحظه‌ای (هر 5 دقیقه)...")
+print("\nشروع اجرای لحظه‌ای (هر 1 ساعت)...")
 while True:
     try:
-        raw_data_5m = dow_jones.history(period="7d", interval="5m")
-        data_5m = resample_to_5m(raw_data_5m)
-        data_5m = calculate_smma(data_5m)
-        data_5m = calculate_mfi(data_5m)
+        raw_data_1h = dow_jones.history(period="7d", interval="1h")
+        data_1h = resample_to_1h(raw_data_1h)
+        data_1h = calculate_smma(data_1h)
+        data_1h = calculate_mfi(data_1h)
 
-        last_close = data_5m["Close"].iloc[-1]
-        smma = data_5m["SMMA"].iloc[-1]
-        mfi_buy = data_5m["MFI_Buy_Signal"].iloc[-1]
-        mfi_sell = data_5m["MFI_Sell_Signal"].iloc[-1]
+        last_close = data_1h["Close"].iloc[-1]
+        smma = data_1h["SMMA"].iloc[-1]
+        mfi_buy = data_1h["MFI_Buy_Signal"].iloc[-1]
+        mfi_sell = data_1h["MFI_Sell_Signal"].iloc[-1]
 
-        last_features = data_5m[feature_cols].iloc[-50:]
+        last_features = data_1h[feature_cols].iloc[-50:]
         scaled_features = scaler.transform(last_features)
         last_input = np.expand_dims(scaled_features, axis=0)
         ml_pred = (model.predict(last_input, verbose=0) > 0.5).astype(int)[0]
@@ -192,7 +214,7 @@ while True:
 
         print(
             f"{time.ctime()} | قیمت: {last_close:.2f} | SMMA: {smma:.2f} | سیگنال: {signal} | پیش‌بینی ML: {ml_signal}")
-        time.sleep(300)
+        time.sleep(3600)  # 1 ساعت
     except Exception as e:
         print(f"خطا: {e}")
         time.sleep(60)
