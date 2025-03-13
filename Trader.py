@@ -2,199 +2,191 @@ import yfinance as yf
 import numpy as np
 import pandas as pd
 import time
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import accuracy_score
 
 
-# تابع تبدیل داده به 4 ساعته
-def resample_to_4h(data):
-    return data.resample("4h").agg({
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum"
+# تابع تبدیل داده به 5 دقیقه
+def resample_to_5m(data):
+    return data.resample("5min").agg({
+        "Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"
     }).dropna()
 
 
-# تابع پیدا کردن سطوح کلیدی
-def find_key_levels(data):
-    all_prices = np.concatenate([data["High"], data["Low"]])
-    price_levels = {}
-    tolerance = 0.002
-    for price in all_prices:
-        hits = np.sum(np.abs(all_prices - price) / price < tolerance)
-        if hits >= 2:  # حداقل برخورد رو کم کردیم
-            price_levels[price] = hits
-    key_levels = sorted(price_levels.items(), key=lambda x: x[1], reverse=True)[:5]
-    return [level[0] for level in key_levels]
-
-
-# تابع محاسبه اندیکاتورها
-def calculate_indicators(data):
-    data["SMA10"] = data["Close"].rolling(window=10).mean()
-    data["SMA30"] = data["Close"].rolling(window=30).mean()
-    delta = data["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
-    data["RSI"] = 100 - (100 / (1 + rs))
-    ema12 = data["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = data["Close"].ewm(span=26, adjust=False).mean()
-    data["MACD"] = ema12 - ema26
-    data["Signal"] = data["MACD"].ewm(span=9, adjust=False).mean()
+# تابع محاسبه MFI
+def calculate_mfi(data, period=14):
+    data["Typical_Price"] = (data["High"] + data["Low"] + data["Close"]) / 3
+    data["Raw_Money_Flow"] = data["Typical_Price"] * data["Volume"]
+    data["Price_Diff"] = data["Typical_Price"].diff()
+    data["Positive_Flow"] = np.where(data["Price_Diff"] > 0, data["Raw_Money_Flow"], 0)
+    data["Negative_Flow"] = np.where(data["Price_Diff"] < 0, data["Raw_Money_Flow"], 0)
+    data["Positive_Sum"] = data["Positive_Flow"].rolling(window=period).sum()
+    data["Negative_Sum"] = data["Negative_Flow"].rolling(window=period).sum()
+    data["Money_Ratio"] = data["Positive_Sum"] / data["Negative_Sum"]
+    data["MFI"] = 100 - (100 / (1 + data["Money_Ratio"]))
+    data["MFI_Buy_Signal"] = np.where(data["MFI"] < 20, 1, 0)
+    data["MFI_Sell_Signal"] = np.where(data["MFI"] > 80, 1, 0)
     return data
 
 
-# تابع تشخیص روند با 20 کندل
-def detect_trend(data, window=20):
-    recent = data["Close"].tail(window)
-    if len(recent) < window:
-        return "نامشخص"
-    trend = (recent.iloc[-1] - recent.iloc[0]) / recent.iloc[0] * 100
-    return "صعودی" if trend > 0 else "نزولی"
+# تابع محاسبه SMMA
+def calculate_smma(data, period=100):
+    data["SMMA"] = data["Close"].rolling(window=period).mean()
+    for i in range(period, len(data)):
+        data.loc[data.index[i], "SMMA"] = (
+                (data["SMMA"].iloc[i - 1] * (period - 1) + data["Close"].iloc[i]) / period
+        )
+    data["Price_Change"] = data["Close"].pct_change()
+    data["Price_Diff"] = data["Close"].diff()
+    data["Volatility"] = data["High"] - data["Low"]
+    data["High_Change"] = data["High"].pct_change()
+    data["Low_Change"] = data["Low"].pct_change()
+    return data
 
 
-# تابع چک کردن الگوی اینگالف
-def check_engulfing(data_30m):
-    if len(data_30m) < 2:
-        return None
-    last_candle = data_30m.iloc[-1]
-    prev_candle = data_30m.iloc[-2]
-
-    if (prev_candle["Close"] < prev_candle["Open"] and
-            last_candle["Close"] > last_candle["Open"] and
-            last_candle["Close"] > prev_candle["Open"] and
-            last_candle["Open"] < prev_candle["Close"]):
-        return "صعودی"
-    elif (prev_candle["Close"] > prev_candle["Open"] and
-          last_candle["Close"] < last_candle["Open"] and
-          last_candle["Close"] < prev_candle["Open"] and
-          last_candle["Open"] > prev_candle["Close"]):
-        return "نزولی"
-    return None
-
-
-# تابع آموزش مدل ML
-def train_ml_model(data):
-    data = calculate_indicators(data.copy())
+# تابع آماده‌سازی داده برای LSTM
+def prepare_lstm_data(data, lookback=20):
+    data = calculate_smma(data.copy())
+    data = calculate_mfi(data)
     data["Target"] = (data["Close"].shift(-1) > data["Close"]).astype(int)
-    data["Volume"] = data["Volume"]
-    data_clean = data[["Close", "SMA10", "SMA30", "RSI", "MACD", "Signal", "Volume", "Target"]].dropna()
-    features = data_clean[["Close", "SMA10", "SMA30", "RSI", "MACD", "Signal", "Volume"]]
-    target = data_clean["Target"]
+    features = data[["Close", "SMMA", "MFI", "Price_Change", "Price_Diff", "Volume", "Volatility", "High_Change",
+                     "Low_Change"]].dropna()
+    target = data["Target"].dropna()
 
-    X_train, X_test, y_train, y_test = train_test_split(features, target, test_size=0.2, shuffle=False)
-    model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42)
-    model.fit(X_train, y_train)
-    accuracy = accuracy_score(y_test, model.predict(X_test))
-    print(f"دقت مدل ML روی داده تست: {accuracy:.2f}")
-    return model, X_test, y_test
+    scaler = MinMaxScaler()
+    scaled_features = scaler.fit_transform(features)
+
+    X, y = [], []
+    for i in range(lookback, len(scaled_features)):
+        X.append(scaled_features[i - lookback:i])
+        y.append(target.iloc[i])
+
+    X = np.array(X)
+    y = np.array(y)
+    return X, y, scaler, features.columns
+
+
+# تابع آموزش مدل LSTM
+def train_lstm_model(data):
+    X, y, scaler, feature_cols = prepare_lstm_data(data)
+    train_size = int(len(X) * 0.8)
+    X_train, X_test = X[:train_size], X[train_size:]
+    y_train, y_test = y[:train_size], y[train_size:]
+
+    model = Sequential()
+    model.add(LSTM(50, return_sequences=True, input_shape=(X.shape[1], X.shape[2])))
+    model.add(Dropout(0.2))
+    model.add(LSTM(50))
+    model.add(Dropout(0.2))
+    model.add(Dense(1, activation="sigmoid"))
+
+    model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+    model.fit(X_train, y_train, epochs=20, batch_size=32, validation_split=0.1, verbose=1)
+
+    y_pred = (model.predict(X_test) > 0.5).astype(int)
+    accuracy = accuracy_score(y_test, y_pred)
+    print(f"دقت مدل LSTM روی داده تست: {accuracy:.2f}")
+    return model, X_test, y_test, scaler, feature_cols
 
 
 # تابع بک‌تست
-def backtest(data_4h, data_30m, key_prices, model, X_test, y_test):
-    cash = 10000
+def backtest(data_5m, model, X_test, y_test, scaler, feature_cols):
+    data_5m = calculate_smma(data_5m.copy())
+    data_5m = calculate_mfi(data_5m)
+    initial_cash = 10000
+    cash = initial_cash
     position = 0
     trades = []
-    buy_price = 0
     ml_correct = 0
     ml_total = 0
-    test_start_idx = len(data_4h) - len(X_test)  # شروع داده‌های تست
+    test_start_idx = len(data_5m) - len(X_test)
 
-    for i in range(30, len(data_4h)):
-        close = data_4h["Close"].iloc[i]
-        near_key_level = any(abs(close - key) / key < 0.01 for key in key_prices)
-        trend = detect_trend(data_4h.iloc[:i + 1])
+    for i in range(100, len(data_5m)):
+        close = data_5m["Close"].iloc[i]
+        smma = data_5m["SMMA"].iloc[i]
+        mfi_buy = data_5m["MFI_Buy_Signal"].iloc[i]
+        mfi_sell = data_5m["MFI_Sell_Signal"].iloc[i]
 
-        # پیش‌بینی ML فقط برای داده‌های تست
+        # پیش‌بینی ML
         if i >= test_start_idx and i - test_start_idx < len(X_test):
-            ml_pred = model.predict(X_test.iloc[i - test_start_idx].values.reshape(1, -1))[0]
-            ml_actual = y_test.iloc[i - test_start_idx]
+            ml_pred = (model.predict(X_test[i - test_start_idx:i - test_start_idx + 1], verbose=0) > 0.5).astype(int)[0]
+            ml_actual = y_test[i - test_start_idx]
             ml_total += 1
             if ml_pred == ml_actual:
                 ml_correct += 1
 
-        # چک کردن اینگالف
-        engulfing = None
-        if near_key_level:
-            current_time = data_4h.index[i]
-            window_30m = data_30m.loc[:current_time].tail(2)
-            engulfing = check_engulfing(window_30m)
-
-        # خرید (فقط روند و سطح کلیدی، اینگالف اختیاری)
-        if near_key_level and trend == "صعودی" and position == 0:
-            if engulfing == "صعودی" or engulfing is None:  # اینگالف تأییدیه اختیاری
-                position = cash / close
-                cash = 0
-                buy_price = close
-                trades.append(("خرید", close, data_4h.index[i]))
+        # خرید
+        if mfi_buy == 1 and close > smma and position == 0:
+            risk_amount = initial_cash * 0.01
+            stop_loss = close * 0.99
+            take_profit = close * 1.02
+            position_size = risk_amount / (close - stop_loss)
+            position = position_size
+            cash -= position * close
+            trades.append(("خرید", close, stop_loss, take_profit, data_5m.index[i]))
 
         # فروش
         elif position > 0:
-            profit_loss = (close - buy_price) / buy_price * 100
-            if near_key_level and trend == "نزولی" and (engulfing == "نزولی" or engulfing is None):
-                cash = position * close
+            if mfi_sell == 1 and close < smma:
+                cash += position * close
                 position = 0
-                trades.append(("فروش", close, data_4h.index[i]))
-            elif profit_loss > 2 or profit_loss < -1:
-                cash = position * close
+                trades.append(("فروش (MFI)", close, data_5m.index[i]))
+            elif close >= take_profit or close <= stop_loss:
+                cash += position * close
                 position = 0
-                trades.append(("فروش (حد سود/ضرر)", close, data_4h.index[i]))
+                trades.append(("فروش (حد)", close, data_5m.index[i]))
 
-    final_value = cash + (position * data_4h["Close"].iloc[-1]) if position > 0 else cash
-    profit = final_value - 10000
+    final_value = cash + (position * data_5m["Close"].iloc[-1]) if position > 0 else cash
+    profit = final_value - initial_cash
     ml_accuracy = ml_correct / ml_total * 100 if ml_total > 0 else 0
 
-    print(f"بک‌تست: سرمایه اولیه: 10000 | نهایی: {final_value:.2f} | سود: {profit:.2f}")
-    print(f"دقت پیش‌بینی ML در بک‌تست (فقط داده تست): {ml_accuracy:.2f}%")
-    print("معاملات:", trades[:5])
+    print(f"بک‌تست: سرمایه اولیه: {initial_cash} | نهایی: {final_value:.2f} | سود: {profit:.2f}")
+    print(f"دقت پیش‌بینی ML در بک‌تست: {ml_accuracy:.2f}%")
+    print(f"تعداد معاملات: {len(trades)} | معاملات: {trades[:5]}")
 
 
-# ---- بخش اصلی ----
+# بخش اصلی
 symbol = "^DJI"
 dow_jones = yf.Ticker(symbol)
 
-# گرفتن داده‌ها
 print("آماده‌سازی داده‌ها و آموزش مدل...")
-raw_data_1h = dow_jones.history(period="1y", interval="1h")
-data_4h = resample_to_4h(raw_data_1h)
-data_30m = dow_jones.history(period="1y", interval="30m")
-key_prices = find_key_levels(data_4h)
-model, X_test, y_test = train_ml_model(data_4h)
+raw_data_5m = dow_jones.history(period="60d", interval="5m")
+data_5m = resample_to_5m(raw_data_5m)
+model, X_test, y_test, scaler, feature_cols = train_lstm_model(data_5m)
 
-# بک‌تست
 print("\nشروع بک‌تست...")
-backtest(data_4h, data_30m, key_prices, model, X_test, y_test)
+backtest(data_5m, model, X_test, y_test, scaler, feature_cols)
 
 # اجرای لحظه‌ای
 print("\nشروع اجرای لحظه‌ای (هر 5 دقیقه)...")
 while True:
     try:
-        raw_data_1h = dow_jones.history(period="30d", interval="1h")
-        data_4h = resample_to_4h(raw_data_1h)
-        data_30m = dow_jones.history(period="5d", interval="30m")
-        key_prices = find_key_levels(data_4h)
+        raw_data_5m = dow_jones.history(period="7d", interval="5m")
+        data_5m = resample_to_5m(raw_data_5m)
+        data_5m = calculate_smma(data_5m)  # شامل Volatility
+        data_5m = calculate_mfi(data_5m)
 
-        last_close = data_4h["Close"].iloc[-1]
-        near_key_level = any(abs(last_close - key) / key < 0.01 for key in key_prices)
-        trend = detect_trend(data_4h)
-        engulfing = check_engulfing(data_30m.tail(2))
+        last_close = data_5m["Close"].iloc[-1]
+        smma = data_5m["SMMA"].iloc[-1]
+        mfi_buy = data_5m["MFI_Buy_Signal"].iloc[-1]
+        mfi_sell = data_5m["MFI_Sell_Signal"].iloc[-1]
 
-        last_features = calculate_indicators(data_4h.copy())[X_test.columns].iloc[-1].to_frame().T
-        ml_pred = model.predict(last_features)[0]
+        last_features = data_5m[feature_cols].iloc[-20:].values  # 20 کندل آخر
+        scaled_features = scaler.transform(last_features)
+        last_input = np.expand_dims(scaled_features, axis=0)
+        ml_pred = (model.predict(last_input, verbose=0) > 0.5).astype(int)[0]
         ml_signal = "صعود" if ml_pred == 1 else "نزول"
 
         signal = "نگه‌داری"
-        if near_key_level:
-            if trend == "صعودی" and (engulfing == "صعودی" or engulfing is None):
-                signal = "خرید"
-            elif trend == "نزولی" and (engulfing == "نزولی" or engulfing is None):
-                signal = "فروش"
+        if mfi_buy == 1 and last_close > smma:
+            signal = "خرید (1% ریسک، 1:2)"
+        elif mfi_sell == 1 and last_close < smma:
+            signal = "فروش (1% ریسک، 1:2)"
 
         print(
-            f"{time.ctime()} | قیمت: {last_close:.2f} | روند: {trend} | اینگالف: {engulfing} | سیگنال: {signal} | پیش‌بینی ML: {ml_signal}")
+            f"{time.ctime()} | قیمت: {last_close:.2f} | SMMA: {smma:.2f} | سیگنال: {signal} | پیش‌بینی ML: {ml_signal}")
         time.sleep(300)
     except Exception as e:
         print(f"خطا: {e}")
